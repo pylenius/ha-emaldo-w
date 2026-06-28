@@ -82,7 +82,7 @@ def build_override_packet(
             the "AI Battery Range = override" flag that the app's Battery
             Range save sends (BmtCmd.SET_RESERVE_MODE_AI). When ``False``
             (default) byte 2 is 0x00 → Battery Range stays in AI mode and
-            only the per-slot overrides apply.
+            only the per-slot overrides apply. Live-confirmed 2026-05-07.
 
     Returns:
         Complete UDP packet ready to send.
@@ -1790,6 +1790,229 @@ def get_manual_selling(
         return parse_manual_selling_response(decrypted)
     finally:
         sock.close()
+
+
+# ---------------------------------------------------------------------------
+# Reserve mode + hourly schedule + PV distribution
+# ---------------------------------------------------------------------------
+#
+# Opcodes (all msg_type high-nibble = 0xA0; subscription mode):
+#   0x16A0  get_current_reservemode    read 1B: mode (1=priceTracking, 2=scheduled, 3=aiAdapter)
+#   0x18A0  get_schedule_reservemode   read 57B: active schedule
+#   0x19A0  set_reservemode            write 54B: mode + 2×24h schedule + flags
+#   0x47A0  get_pv_dist                read 2B: [ai, scheduled] PVPreferenceType
+#   0x48A0  set_pv_dist                write 2B: same
+#
+# Hour bytes are signed int8; only 0 and ±{smart, emergency} are accepted.
+
+_RESERVE_MODE_NAMES = {1: "priceTracking", 2: "scheduled", 3: "aiAdapter"}
+_PV_PREFERENCE_NAMES = {0: "ignore", 1: "followEmaldoAI", 2: "load", 3: "batteryCharge"}
+
+
+def _e2e_roundtrip(
+    e2e_creds: dict,
+    msg_type: int,
+    payload: bytes = b"",
+    *,
+    validator: Callable[[bytes], bool] | None = None,
+    timeout: float = 3.0,
+    log: Callable[..., None] | None = None,
+) -> bytes | None:
+    """alive → wake → heartbeat → command, then decrypt the ACK payload.
+
+    Returns decrypted bytes, or *None* if any step fails or validation
+    rejects the response.
+    """
+    session_nonce = generate_nonce()
+    home_alive = build_alive_packet(
+        sender_end_id=e2e_creds["home_end_id"],
+        sender_group_id=e2e_creds["home_group_id"],
+        end_secret=e2e_creds["home_end_secret"],
+    )
+    dev_alive = build_alive_packet(
+        sender_end_id=e2e_creds["sender_end_id"],
+        sender_group_id=e2e_creds["sender_group_id"],
+        end_secret=e2e_creds["sender_end_secret"],
+    )
+    wake = build_wake_packet(e2e_creds, session_nonce)
+    heartbeat = build_heartbeat_packet(e2e_creds, session_nonce)
+    cmd_pkt = build_subscription_packet(e2e_creds, msg_type, session_nonce, payload=payload)
+
+    host, port = _resolve_host(e2e_creds["host"])
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    addr = (host, port)
+
+    def _send(pkt: bytes, label: str) -> bytes | None:
+        sock.sendto(pkt, addr)
+        try:
+            resp, _ = sock.recvfrom(4096)
+            if log:
+                log(f"{label}: sent {len(pkt)}B \u2192 got {len(resp)}B")
+            return resp
+        except socket.timeout:
+            if log:
+                log(f"{label}: timeout")
+            return None
+
+    try:
+        _send(home_alive, "Alive(home)")
+        _send(dev_alive, "Alive(device)")
+        _send(wake, "Wake")
+        _send(heartbeat, "Heartbeat")
+        time.sleep(0.2)
+        resp = _send(cmd_pkt, f"Cmd(0x{msg_type:02x}A0)")
+        if not resp:
+            return None
+        return decrypt_response(
+            resp, e2e_creds["chat_secret"],
+            payload_validator=validator,
+        )
+    finally:
+        sock.close()
+
+
+def get_current_reservemode(
+    e2e_creds: dict,
+    *,
+    timeout: float = 3.0,
+    log: Callable[..., None] | None = None,
+) -> str | None:
+    """Read currently active reserve mode (opcode 0x16A0).
+
+    Returns one of ``"priceTracking"``, ``"scheduled"``, ``"aiAdapter"``,
+    or *None* if the round-trip fails or the mode is unrecognised.
+    """
+    d = _e2e_roundtrip(e2e_creds, 0x16, validator=lambda b: len(b) >= 1,
+                       timeout=timeout, log=log)
+    if not d:
+        return None
+    return _RESERVE_MODE_NAMES.get(d[0])
+
+
+def get_schedule_reservemode(
+    e2e_creds: dict,
+    *,
+    timeout: float = 3.0,
+    log: Callable[..., None] | None = None,
+) -> dict | None:
+    """Read the active weekday/weekend hourly reserve schedule (opcode 0x18A0).
+
+    Returns a dict with ``smart``, ``emergency``, ``weekdays`` (24 signed
+    int8s), ``weekend`` (24 signed int8s), ``sync``, ``full_charge_kwh``.
+    Hour byte semantics: 0=idle, +N=charge to N% SoC, -N=discharge with
+    N% SoC floor. Valid values: 0, ±smart, ±emergency.
+    """
+    d = _e2e_roundtrip(e2e_creds, 0x18, validator=lambda b: len(b) >= 57,
+                       timeout=timeout, log=log)
+    if not d:
+        return None
+
+    def _sgn(v: int) -> int:
+        return v - 256 if v >= 128 else v
+
+    return {
+        "smart": d[0],
+        "emergency": d[1],
+        "lowpower_alert": d[2],
+        "battery_protect": d[3],
+        "weekdays": [_sgn(d[4 + i]) for i in range(24)],
+        "weekend": [_sgn(d[28 + i]) for i in range(24)],
+        "sync": d[52] == 1,
+        "full_charge_kwh": int.from_bytes(d[53:57], "little") / 1000.0,
+    }
+
+
+def set_reservemode(
+    e2e_creds: dict,
+    mode: str,
+    *,
+    smart: int = 0,
+    emergency: int = 0,
+    weekdays: list[int] | None = None,
+    weekend: list[int] | None = None,
+    sync: bool = False,
+    enable: bool = True,
+    timeout: float = 3.0,
+    log: Callable[..., None] | None = None,
+) -> bool:
+    """Write reserve mode and — for scheduled mode — the hourly pattern.
+
+    Args:
+        mode: One of ``"priceTracking"``, ``"scheduled"``, ``"aiAdapter"``.
+        smart, emergency: Upper/lower SoC thresholds in percent (0..100).
+        weekdays, weekend: Length-24 lists of signed int8 hour values.
+            Must each equal 0, +100 (charge to full), ±smart, or
+            ±emergency; other values (including -100) are silently zeroed
+            by the device.
+        sync: If *True*, weekend mirrors weekdays.
+        enable: Activate the schedule on the device.
+    """
+    try:
+        idx = {"priceTracking": 1, "scheduled": 2, "aiAdapter": 3}[mode]
+    except KeyError:
+        raise ValueError(f"mode must be priceTracking, scheduled, or aiAdapter (got {mode!r})")
+
+    weekdays = list(weekdays or [0] * 24)
+    weekend = list(weekend or [0] * 24)
+    if len(weekdays) != 24 or len(weekend) != 24:
+        raise ValueError("weekdays and weekend must each be length 24")
+
+    payload = bytearray(54)
+    payload[0] = idx - 1
+    payload[2] = smart & 0xFF
+    payload[3] = emergency & 0xFF
+    for i, v in enumerate(weekdays):
+        payload[4 + i] = v & 0xFF
+    for i, v in enumerate(weekend):
+        payload[28 + i] = v & 0xFF
+    payload[52] = 1 if sync else 0
+    payload[53] = 1 if enable else 0
+
+    d = _e2e_roundtrip(e2e_creds, 0x19, payload=bytes(payload), timeout=timeout, log=log)
+    return d is not None
+
+
+def get_pv_dist(
+    e2e_creds: dict,
+    *,
+    timeout: float = 3.0,
+    log: Callable[..., None] | None = None,
+) -> dict | None:
+    """Read PV distribution preference for AI and scheduled reserve modes.
+
+    Returns ``{"ai": <name>, "scheduled": <name>}`` where names are one of
+    ``ignore``, ``followEmaldoAI``, ``load`` (Load First), or
+    ``batteryCharge`` (Charge First).
+    """
+    d = _e2e_roundtrip(e2e_creds, 0x47, validator=lambda b: len(b) >= 2,
+                       timeout=timeout, log=log)
+    if not d:
+        return None
+    return {
+        "ai": _PV_PREFERENCE_NAMES.get(d[0], f"unknown({d[0]})"),
+        "scheduled": _PV_PREFERENCE_NAMES.get(d[1], f"unknown({d[1]})"),
+    }
+
+
+def set_pv_dist(
+    e2e_creds: dict,
+    ai: str,
+    scheduled: str,
+    *,
+    timeout: float = 3.0,
+    log: Callable[..., None] | None = None,
+) -> bool:
+    """Write PV distribution preference. ``ai`` and ``scheduled`` must each
+    be one of ``ignore``, ``followEmaldoAI``, ``load``, or ``batteryCharge``.
+    """
+    name_to_idx = {v: k for k, v in _PV_PREFERENCE_NAMES.items()}
+    try:
+        payload = bytes([name_to_idx[ai], name_to_idx[scheduled]])
+    except KeyError as e:
+        raise ValueError(f"invalid PV preference: {e.args[0]!r}")
+    d = _e2e_roundtrip(e2e_creds, 0x48, payload=payload, timeout=timeout, log=log)
+    return d is not None
 
 
 # ---------------------------------------------------------------------------
